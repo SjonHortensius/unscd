@@ -133,8 +133,12 @@ vda.linux@googlemail.com
  *        EXPERIMENTAL
  * 0.42   execute /proc/self/exe by link name first (better comm field)
  * 0.43   fix off-by-one error in setgroups
+ * 0.44   make -d[ddd] bump up debug - easier to explain to users
+ *        how to produce detailed log (no nscd.conf tweaking)
+ * 0.45   Fix out-of-bounds array access and log/pid file permissions -
+ *        thanks to Sebastian Krahmer (krahmer AT suse.de)
  */
-#define PROGRAM_VERSION "0.43"
+#define PROGRAM_VERSION "0.45"
 
 #define DEBUG_BUILD 1
 
@@ -142,6 +146,8 @@ vda.linux@googlemail.com
 /*
 ** Generic helpers
 */
+
+#define ARRAY_SIZE(x) ((unsigned)(sizeof(x) / sizeof((x)[0])))
 
 #define NORETURN __attribute__ ((__noreturn__))
 
@@ -522,9 +528,9 @@ static const char *self_exe_points_to = "/proc/self/exe";
 
 /* Header common to all requests */
 #define USER_REQ_STRUCT \
-	int32_t version; /* Version number of the daemon interface */ \
-	int32_t type;    /* Service requested */ \
-	int32_t key_len; /* Key length */
+	uint32_t version; /* Version number of the daemon interface */ \
+	uint32_t type;    /* Service requested */ \
+	uint32_t key_len; /* Key length */
 
 typedef struct user_req_header {
 	USER_REQ_STRUCT
@@ -1418,7 +1424,9 @@ static void worker(const char *param)
 	signal(SIGILL,    worker_signal_handler);
 	signal(SIGFPE,    worker_signal_handler);
 	signal(SIGABRT,   worker_signal_handler);
+#ifdef SIGSTKFLT
 	signal(SIGSTKFLT, worker_signal_handler);
+#endif
 
 	if (ureq.type == GETHOSTBYNAME
 	 || ureq.type == GETHOSTBYNAMEv6
@@ -1477,7 +1485,7 @@ static const char checked_filenames[][sizeof("/etc/passwd")] = {
 	[SRV_HOSTS]  = "/etc/hosts", /* "/etc/resolv.conf" "/etc/nsswitch.conf"? */
 };
 
-static long checked_status[sizeof(checked_filenames) / sizeof(checked_filenames[0])];
+static long checked_status[ARRAY_SIZE(checked_filenames)];
 
 static void check_files(int srv)
 {
@@ -1506,9 +1514,12 @@ static int handle_client(int i)
 	user_req **cache_pp;
 	user_req *ureq_and_resp;
 
+#if DEBUG_BUILD
 	log(L_DEBUG, "version:%d type:%d(%s) key_len:%d '%s'",
-			ureq->version, ureq->type, typestr[ureq->type],
+			ureq->version, ureq->type,
+			ureq->type < ARRAY_SIZE(typestr) ? typestr[ureq->type] : "BAD",
 			ureq->key_len, req_str(ureq->type, ureq->reqbuf));
+#endif
 
 	if (ureq->version != NSCD_VERSION) {
 		log(L_INFO, "wrong version");
@@ -2373,6 +2384,7 @@ void __nss_disable_nscd(void);
 int main(int argc, char **argv)
 {
 	int n;
+	unsigned opt_d_cnt;
 	const char *env_U;
 	const char *conffile;
 
@@ -2399,9 +2411,11 @@ int main(int argc, char **argv)
 	readlink_self_exe();
 
 	conffile = default_conffile;
+	opt_d_cnt = 0;
 	while ((n = getopt_long(argc, argv, "df:i:KVgt:", longopt, NULL)) != -1) {
 		switch (n) {
 		case 'd':
+			opt_d_cnt++;
 			debug &= ~D_DAEMON;
 			break;
 		case 'f':
@@ -2429,6 +2443,11 @@ int main(int argc, char **argv)
 			print_help_and_die();
 		}
 	}
+	/* Multiple -d can bump debug regardless of nscd.conf:
+	 * no -d or -d: 0, -dd: 1,
+	 * -ddd: 3, -dddd: 7, -ddddd: 15
+	 */
+	debug |= (((1U << opt_d_cnt) >> 1) - 1) & L_ALL;
 
 	env_U = getenv("U");
 	/* Avoid duplicate warnings if $U exists */
@@ -2487,8 +2506,10 @@ int main(int argc, char **argv)
 	signal(SIGALRM, SIG_DFL);
 #endif
 
-	umask(0); /* prevent bad mode of NSCD_DIR if umask is e.g. 077 */
-	mkdir(NSCD_DIR, 0755);
+	if (mkdir(NSCD_DIR, 0755) == 0) {
+		/* prevent bad mode of NSCD_DIR if umask is e.g. 077 */
+		chmod(NSCD_DIR, 0755);
+	}
 	pfd[0].fd = open_socket(NSCD_SOCKET);
 	pfd[1].fd = open_socket(NSCD_SOCKET_OLD);
 	pfd[0].events = POLLIN;
