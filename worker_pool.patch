@@ -1,0 +1,404 @@
+--- nscd.c.orig	2014-06-03 11:46:45.000000000 -0700
++++ nscd.c	2014-06-03 11:46:45.000000000 -0700
+@@ -149,6 +149,23 @@
+ 
+ #define DEBUG_BUILD 1
+ 
++#define WORKER_POOL
++#ifdef WORKER_POOL
++#include <search.h>
++#include <stdbool.h>
++
++typedef struct worker {
++	struct worker *forward;
++	struct worker *backward;
++	pid_t	pid;
++	int	wr;
++	int	rd;
++	bool	active;
++	time_t	create_time;
++} worker_t;
++
++static worker_t *workers;
++#endif /* WORKER_POOL */
+ 
+ /*
+ ** Generic helpers
+@@ -679,6 +696,9 @@
+ 	user_req *resptr;       /* response */
+ 	user_req **cache_pp;    /* cache entry address */
+ 	user_req *ureq;         /* request (points to client_buf[x]) */
++#ifdef WORKER_POOL
++	worker_t *worker;
++#endif
+ } client_info;
+ 
+ static unsigned g_now_ms;
+@@ -805,12 +825,19 @@
+ {
+ 	log(L_DEBUG, "closing client %u (fd %u,%u)", i, pfd[i].fd, cinfo[i].client_fd);
+ 	/* Paranoia. We had nasty bugs where client was closed twice. */
++#ifndef WORKER_POOL
+ 	if (pfd[i].fd == 0)
+ 		return;
+ 
+ 	close(pfd[i].fd);
+ 	if (cinfo[i].client_fd && cinfo[i].client_fd != pfd[i].fd)
+ 		close(cinfo[i].client_fd);
++#else
++	if (cinfo[i].client_fd && cinfo[i].client_fd != pfd[i].fd)
++		close(cinfo[i].client_fd);
++	else if (pfd[i].fd && (!cinfo[i].worker || pfd[i].fd != cinfo[i].worker->rd))
++		close(pfd[i].fd);
++#endif /* WORKER_POOL */
+ 	pfd[i].fd = 0; /* flag as unused (coalescing needs this) */
+ 	busy_cbuf[cinfo[i].bufidx] = 0;
+ 
+@@ -1368,6 +1395,8 @@
+ ** Worker child
+ */
+ 
++#ifndef WORKER_POOL
++
+ /* Spawns a worker and feeds it with user query on stdin */
+ /* Returns stdout fd of the worker, in blocking mode */
+ static int create_and_feed_worker(user_req *ureq)
+@@ -1421,6 +1450,157 @@
+ 	return to_parent.rd;
+ }
+ 
++#else
++
++static void insert_worker(worker_t *worker)
++{
++	if (!workers) {
++		worker->forward = worker;
++		worker->backward = worker;
++		insque(worker, worker);
++		workers = worker;
++	} else {
++		insque(worker, workers);
++	}
++}
++
++static void remove_worker(worker_t *worker)
++{
++	if (worker->forward == worker) {
++		workers = NULL;
++	} else {
++		if (workers == worker)
++			workers = worker->forward;
++		remque(worker);
++	}
++}
++
++static worker_t *find_free_worker() {
++	worker_t *elem = workers;
++
++	if (!elem)
++		return NULL;
++
++	do
++	{
++		if (elem->pid && !elem->active)
++			return elem;
++		elem = elem->forward;
++	} while (elem != NULL && elem != workers);
++
++	return NULL;
++}
++
++static void reap_workers() {
++	worker_t *elem;
++	worker_t *next = workers;
++	time_t now = time(NULL);
++
++	if (!next)
++		return;
++
++	do
++	{
++		elem = next;
++		next = elem->forward;
++		if (next == elem)
++			next = NULL;
++		if (elem->pid && ((elem->create_time > now) || ((elem->create_time + WORKER_TIMEOUT_SEC) < now) )) {
++			remove_worker(elem);
++			close(elem->rd);
++			close(elem->wr);
++			free(elem);
++		}
++	} while (next != NULL && next != workers);
++}
++
++static worker_t *create_worker()
++{
++	pid_t pid;
++	struct {
++		int rd;
++		int wr;
++	} to_child, to_parent;
++	worker_t *worker;
++
++	worker = find_free_worker();
++	if (worker) {
++		log(L_DEBUG, "reusing worker (pid %d)", worker->pid);
++		worker->active = true;
++		return worker;
++	}
++
++	worker = malloc(sizeof(worker_t));
++	if (!worker)
++		return NULL;
++
++	/* NB: these pipe fds are in blocking mode and non-CLOEXECed */
++	xpipe(&to_child.rd);
++	xpipe(&to_parent.rd);
++
++	pid = vfork();
++	if (pid < 0) /* error */
++		perror_and_die("vfork");
++	if (!pid) { /* child */
++		char param[sizeof(int)*3 + 2];
++		char *argv[3];
++
++		close(to_child.wr);
++		close(to_parent.rd);
++		xmovefd(to_child.rd, 0);
++		xmovefd(to_parent.wr, 1);
++		sprintf(param, "%u", debug);
++		argv[0] = (char*) "worker_nscd";
++		argv[1] = param;
++		argv[2] = NULL;
++		/* Re-exec ourself, cleaning up all allocated memory.
++		 * fds in parent are marked CLOEXEC and will be closed too
++		 * (modulo bugs) */
++		/* Try link name first: it's better to have comm field
++		 * of "nscd" than "exe" (pgrep reported to fail to find us
++		 * by name when comm field contains "exe") */
++		execve(self_exe_points_to, argv, argv+2);
++		xexecve("/proc/self/exe", argv, argv+2);
++	}
++
++	log(L_DEBUG, "forked worker (pid %d)", pid);
++
++	/* parent */
++	close(to_child.rd);
++	close(to_parent.wr);
++
++	close_on_exec(to_child.wr);
++	close_on_exec(to_parent.rd);
++
++        worker->pid = pid;
++        worker->wr = to_child.wr;
++        worker->rd = to_parent.rd;
++        worker->active = true;
++        worker->create_time = time(NULL);
++
++	insert_worker(worker);
++
++	return worker;
++}
++
++/* Spawns a worker and feeds it with user query on stdin */
++/* Returns stdout fd of the worker, in blocking mode */
++static worker_t *create_and_feed_worker(user_req *ureq)
++{
++	worker_t *worker = create_worker();
++
++	if (!worker)
++		return NULL;
++
++	/* We do not expect child to block for any noticeably long time,
++	 * and also we expect write to be one-piece one:
++	 * ureq size is <= 1k and pipes are guaranteed to accept
++	 * at least PIPE_BUF at once */
++	xsafe_write(worker->wr, ureq, ureq_size(ureq));
++	return worker;
++}
++#endif /* WORKER_POOL */
++
+ static user_req *worker_ureq;
+ 
+ #if DEBUG_BUILD
+@@ -1460,6 +1640,7 @@
+ }
+ 
+ static void worker(const char *param) NORETURN;
++#ifndef WORKER_POOL
+ static void worker(const char *param)
+ {
+ 	user_req ureq;
+@@ -1534,7 +1715,87 @@
+ 	}
+ 	_exit(0);
+ }
++#else
++static void worker(const char *param)
++{
++	user_req ureq;
++	void *resp;
++	FILE *output=fdopen(1,"w");
+ 
++	debug = atoi(param);
++
++	worker_ureq = &ureq; /* for signal handler */
++
++	/* Make sure we won't hang, but rather die */
++	if (WORKER_TIMEOUT_SEC)
++		alarm(2*WORKER_TIMEOUT_SEC);
++
++	signal(SIGSEGV,   worker_signal_handler);
++	signal(SIGBUS,    worker_signal_handler);
++	signal(SIGILL,    worker_signal_handler);
++	signal(SIGFPE,    worker_signal_handler);
++	signal(SIGABRT,   worker_signal_handler);
++#ifdef SIGSTKFLT
++	signal(SIGSTKFLT, worker_signal_handler);
++#endif
++
++	/* NB: fds 0, 1 are in blocking mode */
++
++	/* We block here (for a short time) */
++	/* Due to ureq size < PIPE_BUF read is atomic */
++	/* No error or size checking: we trust the parent */
++	while (0 != safe_read(0, &ureq, sizeof(ureq))) {
++
++		if (ureq.type == GETHOSTBYNAME
++		 || ureq.type == GETHOSTBYNAMEv6
++		) {
++			resp = marshal_hostent(
++				ureq.type == GETHOSTBYNAME
++				? gethostbyname(ureq.reqbuf)
++				: gethostbyname2(ureq.reqbuf, AF_INET6)
++			);
++		} else if (ureq.type == GETHOSTBYADDR
++		 || ureq.type == GETHOSTBYADDRv6
++		) {
++			resp = marshal_hostent(gethostbyaddr(ureq.reqbuf, ureq.key_len,
++				(ureq.type == GETHOSTBYADDR ? AF_INET : AF_INET6)
++			));
++		} else if (ureq.type == GETPWBYNAME) {
++			struct passwd *pw;
++			log(L_DEBUG2, "getpwnam('%s')", ureq.reqbuf);
++			pw = getpwnam(ureq.reqbuf);
++			log(L_DEBUG2, "getpwnam result:%p", pw);
++			resp = marshal_passwd(pw);
++		} else if (ureq.type == GETPWBYUID) {
++			resp = marshal_passwd(getpwuid(atoi(ureq.reqbuf)));
++		} else if (ureq.type == GETGRBYNAME) {
++			struct group *gr = getgrnam(ureq.reqbuf);
++			resp = marshal_group(gr);
++		} else if (ureq.type == GETGRBYGID) {
++			struct group *gr = getgrgid(atoi(ureq.reqbuf));
++			resp = marshal_group(gr);
++		} else if (ureq.type == GETAI) {
++			resp = obtain_addrinfo(ureq.reqbuf);
++		} else /*if (ureq.type == INITGROUPS)*/ {
++			resp = obtain_initgroups(ureq.reqbuf);
++		}
++
++		if (!((response_header*)resp)->found) {
++			/* Parent knows about this special case */
++			// xfull_write(1, resp, 8);
++			fwrite(resp, 8, 1, output);
++		} else {
++			/* Responses can be big (getgrnam("guest") on a big user db),
++			 * we cannot rely on them being atomic. full_write loops
++			 * if needed */
++			// xfull_write(1, resp, ((response_header*)resp)->version_or_size);
++			fwrite(resp, ((response_header*)resp)->version_or_size, 1, output);
++		}
++		fflush(output);
++	} /* while */
++	_exit(0);
++}
++#endif /* WORKER_POOL */
+ 
+ /*
+ ** Main loop
+@@ -1583,6 +1844,9 @@
+ 	user_req *ureq = cinfo[i].ureq;
+ 	user_req **cache_pp;
+ 	user_req *ureq_and_resp;
++#ifdef WORKER_POOL
++	worker_t *worker;
++#endif /* WORKER_POOL */
+ 
+ #if DEBUG_BUILD
+ 	log(L_DEBUG, "version:%d type:%d(%s) key_len:%d '%s'",
+@@ -1722,7 +1986,15 @@
+ 	log(L_DEBUG, "stored %p in cache, starting a worker", ureq_and_resp);
+ 	/* Now we will wait on worker's fd, not client's! */
+ 	cinfo[i].client_fd = pfd[i].fd;
++#ifdef WORKER_POOL
++	worker = create_and_feed_worker(ureq);
++	if (worker) {
++		pfd[i].fd = worker->rd;
++		cinfo[i].worker = worker;
++	}
++#else
+ 	pfd[i].fd = create_and_feed_worker(ureq);
++#endif /* WORKER_POOL */
+ 	return 0;
+ }
+ 
+@@ -1759,12 +2031,20 @@
+ 	response_header *resp;
+ 	unsigned sz, resp_sz;
+ 	unsigned ureq_sz_aligned;
++	unsigned ref;
++#ifdef WORKER_POOL
++	worker_t *worker = cinfo[i].worker;
++#endif /* WORKER_POOL */
+ 
+ 	cached = NULL;
+ 	ureq = cinfo[i].ureq;
+ 	ureq_sz_aligned = (char*)ureq_response(ureq) - (char*)ureq;
+ 
++#ifndef WORKER_POOL
+ 	sz = full_read(pfd[i].fd, &sz_and_found, sizeof(sz_and_found));
++#else
++	sz = full_read(pfd[i].fd, &sz_and_found, 8);
++#endif /* WORKER_POOL */
+ 	if (sz < 8) {
+ 		/* worker was killed? */
+ 		log(L_DEBUG, "worker gave short reply:%u < 8", sz);
+@@ -1810,10 +2090,12 @@
+ 	hex_dump(resp, resp_sz);
+ 
+  wo:
++#ifndef WORKER_POOL
+ 	close(pfd[i].fd);
++#endif /* WORKER_POOL */
+ 
+ 	/* Save in cache */
+-	unsigned ref = 0;
++	ref = 0;
+ 	user_req **cache_pp = cinfo[i].cache_pp;
+ 	if (cache_pp != NULL) { /* if not a fake entry */
+ 		ureq = *cache_pp;
+@@ -1847,6 +2129,11 @@
+ 		log(L_DEBUG2, "%p.refcount=%u", cached, ref);
+ 	}
+ 	aging_interval_ms = min_aging_interval_ms;
++
++#ifdef WORKER_POOL
++	if (worker)
++		worker->active = false;
++#endif /* WORKER_POOL */
+ }
+ 
+ static void main_loop(void)
+@@ -2062,6 +2349,11 @@
+ 			age_cache(/*free_all:*/ 0, -1);
+ 		}
+ 
++#ifdef WORKER_POOL
++		/* Close timed out workers */
++		reap_workers();
++#endif /* WORKER_POOL */
++
+ 		/* Close timed out client connections */
+ 		for (i = 2; i < num_clients; i++) {
+ 			if (pfd[i].fd != 0 /* not closed yet? */
