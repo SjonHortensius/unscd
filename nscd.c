@@ -135,11 +135,8 @@ vda.linux@googlemail.com
  * 0.43   fix off-by-one error in setgroups
  * 0.44   make -d[ddd] bump up debug - easier to explain to users
  *        how to produce detailed log (no nscd.conf tweaking)
- * 0.45   Fix out-of-bounds array access and log/pid file permissions -
- *        thanks to Sebastian Krahmer (krahmer AT suse.de)
- * 0.46   fix a case when we forgot to remove a future entry on worker failure
  */
-#define PROGRAM_VERSION "0.46"
+#define PROGRAM_VERSION "0.44"
 
 #define DEBUG_BUILD 1
 
@@ -147,8 +144,6 @@ vda.linux@googlemail.com
 /*
 ** Generic helpers
 */
-
-#define ARRAY_SIZE(x) ((unsigned)(sizeof(x) / sizeof((x)[0])))
 
 #define NORETURN __attribute__ ((__noreturn__))
 
@@ -529,9 +524,9 @@ static const char *self_exe_points_to = "/proc/self/exe";
 
 /* Header common to all requests */
 #define USER_REQ_STRUCT \
-	uint32_t version; /* Version number of the daemon interface */ \
-	uint32_t type;    /* Service requested */ \
-	uint32_t key_len; /* Key length */
+	int32_t version; /* Version number of the daemon interface */ \
+	int32_t type;    /* Service requested */ \
+	int32_t key_len; /* Key length */
 
 typedef struct user_req_header {
 	USER_REQ_STRUCT
@@ -1425,9 +1420,7 @@ static void worker(const char *param)
 	signal(SIGILL,    worker_signal_handler);
 	signal(SIGFPE,    worker_signal_handler);
 	signal(SIGABRT,   worker_signal_handler);
-#ifdef SIGSTKFLT
 	signal(SIGSTKFLT, worker_signal_handler);
-#endif
 
 	if (ureq.type == GETHOSTBYNAME
 	 || ureq.type == GETHOSTBYNAMEv6
@@ -1486,7 +1479,7 @@ static const char checked_filenames[][sizeof("/etc/passwd")] = {
 	[SRV_HOSTS]  = "/etc/hosts", /* "/etc/resolv.conf" "/etc/nsswitch.conf"? */
 };
 
-static long checked_status[ARRAY_SIZE(checked_filenames)];
+static long checked_status[sizeof(checked_filenames) / sizeof(checked_filenames[0])];
 
 static void check_files(int srv)
 {
@@ -1515,12 +1508,9 @@ static int handle_client(int i)
 	user_req **cache_pp;
 	user_req *ureq_and_resp;
 
-#if DEBUG_BUILD
 	log(L_DEBUG, "version:%d type:%d(%s) key_len:%d '%s'",
-			ureq->version, ureq->type,
-			ureq->type < ARRAY_SIZE(typestr) ? typestr[ureq->type] : "BAD",
+			ureq->version, ureq->type, typestr[ureq->type],
 			ureq->key_len, req_str(ureq->type, ureq->reqbuf));
-#endif
 
 	if (ureq->version != NSCD_VERSION) {
 		log(L_INFO, "wrong version");
@@ -1629,7 +1619,6 @@ static int handle_client(int i)
 		/* Not found. Remember a pointer where it will appear */
 		cinfo[i].cache_pp = cache_pp;
 
-		/* If it does not point to our own ureq buffer... */
 		if (CACHE_PTR(ureq_and_resp) != ureq) {
 			/* We are not the first client who wants this */
 			log(L_DEBUG, "another request is in progress (%p), waiting for its result", ureq_and_resp);
@@ -1806,7 +1795,7 @@ static void main_loop(void)
 			cnt++;
 		}
 #else
-		log(L_DEBUG, "poll %d ms. clients:%u cached:%u hit ratio:%u/%u",
+		log(L_DEBUG, "poll (%d ms). clients:%u cached:%u hit ratio:%u/%u",
 				r, num_clients, cached_cnt, cache_hit_cnt, cache_access_cnt);
 #endif
 
@@ -1922,25 +1911,10 @@ static void main_loop(void)
 				goto write_out;
 			}
 
-			/* POLLHUP means pfd[i].fd is closed by peer.
-			 * POLLHUP+POLLOUT is seen when we switch for writeout
-			 * and see that pfd[i].fd is closed by peer. */
-			if ((pfd[i].revents & ~POLLOUT) == POLLHUP) {
-				int is_client = (cinfo[i].client_fd == 0 || cinfo[i].client_fd == pfd[i].fd);
-				log(L_INFO, "%s %u disappeared (got POLLHUP on fd %d)",
-					is_client ? "client" : "worker",
-					i,
-					pfd[i].fd
-				);
-				if (is_client)
-					close_client(i);
-				else {
-					/* Read worker output anyway, error handling
-					 * in that function deals with short read.
-					 * Simply closing client is wrong: it leaks
-					 * shared future entries. */
-					handle_worker_response(i);
-				}
+			if (pfd[i].revents == POLLHUP) {
+				/* POLLHUP means we can't write to it anymore */
+				log(L_INFO, "client %u disappered (got POLLHUP)", i);
+				close_client(i);
 				continue;
 			}
 
@@ -2523,10 +2497,8 @@ int main(int argc, char **argv)
 	signal(SIGALRM, SIG_DFL);
 #endif
 
-	if (mkdir(NSCD_DIR, 0755) == 0) {
-		/* prevent bad mode of NSCD_DIR if umask is e.g. 077 */
-		chmod(NSCD_DIR, 0755);
-	}
+	umask(0); /* prevent bad mode of NSCD_DIR if umask is e.g. 077 */
+	mkdir(NSCD_DIR, 0755);
 	pfd[0].fd = open_socket(NSCD_SOCKET);
 	pfd[1].fd = open_socket(NSCD_SOCKET_OLD);
 	pfd[0].events = POLLIN;
